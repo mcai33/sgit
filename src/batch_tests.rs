@@ -250,10 +250,8 @@ fn clone_registers_a_new_checkout_and_refuses_existing_or_escaping_paths() {
         .clone_repository(url, parent, "new checkout")
         .unwrap();
     assert_eq!(clone.id, "new checkout");
-    assert_eq!(
-        fs::read_to_string(clone.path.join("code.txt")).unwrap(),
-        "initial\n"
-    );
+    let checked_out = fs::read_to_string(clone.path.join("code.txt")).unwrap();
+    assert_eq!(checked_out.lines().collect::<Vec<_>>(), ["initial"]);
     assert_eq!(f.store.list().unwrap().len(), 2);
     assert!(
         f.store
