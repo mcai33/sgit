@@ -1,0 +1,20 @@
+[package]
+name = "sgit-desktop"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.90"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+sgit = { path = "../.." }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+
+[target.'cfg(not(windows))'.dependencies]
+trash = "~5.2.9"
+
+[target.'cfg(windows)'.dependencies]
+dunce = "1"
+windows = { version = "0.62", features = ["Win32_System_Com", "Win32_UI_Shell"] }

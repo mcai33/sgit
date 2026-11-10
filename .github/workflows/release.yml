@@ -1,0 +1,171 @@
+name: Build and publish release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: stable
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-arm64
+            runner: macos-15
+            bundles: dmg
+            signing: '-'
+          - platform: macos-x64
+            runner: macos-15-intel
+            bundles: dmg
+            signing: '-'
+          - platform: windows-x64
+            runner: windows-2025
+            bundles: nsis
+            signing: ''
+          - platform: linux-x64
+            runner: ubuntu-22.04
+            bundles: deb,appimage
+            signing: ''
+    env:
+      PLATFORM: ${{ matrix.platform }}
+      BUNDLES: ${{ matrix.bundles }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Check release version
+        shell: bash
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+$ ]]
+          version=$(node -p 'require("./desktop/src-tauri/tauri.conf.json").version')
+          [[ "$version" == "${GITHUB_REF_NAME#v}.0" ]]
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            libxdo-dev libssl-dev libfuse2 patchelf
+
+      - name: Test and build CLI
+        shell: bash
+        run: |
+          cargo test --locked
+          cargo build --locked --release --bin sgit
+
+      - name: Install and check frontend
+        working-directory: desktop
+        shell: bash
+        run: |
+          npm ci
+          npm run check
+
+      - name: Bundle desktop application
+        working-directory: desktop
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ matrix.signing }}
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+        run: npm run tauri -- build --ci --bundles "$BUNDLES" -- --locked
+        shell: bash
+
+      - name: Collect installers
+        shell: bash
+        run: |
+          mkdir -p release
+          shopt -s nullglob
+          bundle_dir=desktop/src-tauri/target/release/bundle
+          IFS=, read -ra bundle_types <<< "$BUNDLES"
+          for type in "${bundle_types[@]}"; do
+            case "$type" in
+              dmg) extension=dmg ;;
+              deb) extension=deb ;;
+              appimage) extension=AppImage ;;
+              nsis) extension=exe ;;
+              *) exit 1 ;;
+            esac
+            files=("$bundle_dir/$type/"*."$extension")
+            if (( ${#files[@]} != 1 )); then
+              echo "Expected one $type installer in $bundle_dir/$type" >&2
+              exit 1
+            fi
+            cp "${files[0]}" "release/sgit-$GITHUB_REF_NAME-$PLATFORM.$extension"
+          done
+
+      - name: Archive CLI for macOS or Linux
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          [[ "$(target/release/sgit --version)" == "sgit ${GITHUB_REF_NAME#v}" ]]
+          tar -czf "release/sgit-cli-$GITHUB_REF_NAME-$PLATFORM.tar.gz" -C target/release sgit
+
+      - name: Archive CLI for Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.Substring(1)
+          if ((& ./target/release/sgit.exe --version) -ne "sgit $version") {
+            throw "CLI version does not match the release tag."
+          }
+          Compress-Archive -LiteralPath target/release/sgit.exe -DestinationPath "release/sgit-cli-${env:GITHUB_REF_NAME}-${env:PLATFORM}.zip"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sgit-${{ matrix.platform }}
+          path: release/*
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: sgit-*
+          path: release
+          merge-multiple: true
+
+      - name: Publish all platform packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(release/*)
+          [[ ${#files[@]} -eq 9 ]]
+          gh release create "$GITHUB_REF_NAME" "${files[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "sgit ${GITHUB_REF_NAME#v}" \
+            --generate-notes \
+            --notes '桌面端需要系统 Git。macOS 安装包使用临时签名，未经 Apple 公证。Windows 安装包未签名。'

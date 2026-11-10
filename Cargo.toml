@@ -1,0 +1,10 @@
+[package]
+name = "sgit"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.89"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
