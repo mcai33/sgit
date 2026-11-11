@@ -269,3 +269,21 @@ main .banner { border: 1px solid var(--line); border-radius: 7px; margin-bottom:
   color: inherit;
   font: inherit;
 }
+
+.worktree-files { border-top: 1px solid var(--line); padding: 10px 22px; }
+.worktree-feedback { padding: 0 22px; }
+.worktree-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.worktree-heading h3 { margin: 0; font-size: 13px; }
+.worktree-heading h3 span { margin-left: 4px; font-weight: normal; color: var(--muted); }
+.worktree-heading button, .file-actions button { padding: 4px 7px; font-size: 12px; white-space: nowrap; }
+.worktree-files p { margin: 8px 0; font-size: 12px; }
+.file-list { max-height: 132px; overflow: auto; list-style: none; margin: 6px 0 0; padding: 0; }
+.file-list li { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 5px 0; border-bottom: 1px solid var(--line); font-size: 12px; }
+.file-list code { min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.file-list span { flex: none; color: var(--muted); }
+.file-change { display: flex; flex: 1; min-width: 0; align-items: center; gap: 9px; }
+.file-change span { white-space: nowrap; }
+.file-change code { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.file-actions { flex: none; gap: 4px; }
+.restore-confirmation { margin-top: 6px; padding: 6px 10px 10px; border-radius: 6px; background: #fff1ec; color: var(--warning); }
+.restore-confirmation .actions { justify-content: flex-end; }

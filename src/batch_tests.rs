@@ -115,6 +115,10 @@ fn manual_sync_pushes_only_after_approval_and_only_includes_selected_new_files()
     assert!(result.ready(), "{:?}", result.items);
     let files = git(&f.remote, &["ls-tree", "--name-only", "main"]);
     assert_eq!(files, "-include.txt\ncode.txt");
+    assert_eq!(
+        git(&f.remote, &["log", "-1", "--format=%s", "main"]),
+        "Sgit Auto: -include.txt, code.txt"
+    );
     assert!(f.a.join("private.txt").exists());
 }
 
@@ -304,4 +308,268 @@ fn trash_refuses_to_move_a_repository_with_other_linked_worktrees() {
     assert!(error.contains("worktree"));
     assert!(linked.join("code.txt").is_file());
     assert_eq!(f.store.list().unwrap().len(), 1);
+}
+
+#[test]
+fn restore_discards_reviewed_tracked_edits_and_keeps_untracked_files() {
+    let f = Fixture::new();
+    let repo = f.store.list().unwrap().remove(0);
+    fs::write(f.a.join("code.txt"), "staged\n").unwrap();
+    git(&f.a, &["add", "code.txt"]);
+    fs::write(f.a.join("code.txt"), "unstaged\n").unwrap();
+    fs::write(f.a.join("[new].txt"), "staged new file\n").unwrap();
+    git(&f.a, &["--literal-pathspecs", "add", "--", "[new].txt"]);
+    fs::write(f.a.join("private.txt"), "keep\n").unwrap();
+
+    let preview = f.store.worktree_changes(&repo).unwrap();
+    assert_eq!(preview.untracked, ["private.txt"]);
+    assert_eq!(
+        preview
+            .tracked
+            .iter()
+            .map(|file| (file.path.as_str(), file.status.as_str()))
+            .collect::<Vec<_>>(),
+        [("[new].txt", "A "), ("code.txt", "MM")]
+    );
+    f.store
+        .apply_file_action(&repo, &preview.token, FileAction::Clean, None)
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(f.a.join("code.txt")).unwrap(),
+        "initial\n"
+    );
+    assert!(!f.a.join("[new].txt").exists());
+    assert_eq!(
+        fs::read_to_string(f.a.join("private.txt")).unwrap(),
+        "keep\n"
+    );
+    assert_eq!(git(&f.a, &["status", "--porcelain"]), "?? private.txt");
+}
+
+#[test]
+fn restore_refuses_to_overwrite_a_recreated_staged_deletion() {
+    let f = Fixture::new();
+    let repo = f.store.list().unwrap().remove(0);
+    git(&f.a, &["rm", "code.txt"]);
+    let preview = f.store.worktree_changes(&repo).unwrap();
+    let token = preview.token;
+    fs::write(f.a.join("code.txt"), "keep this\n").unwrap();
+    assert!(
+        f.store
+            .apply_file_action(&repo, &token, FileAction::Clean, None)
+            .is_err()
+    );
+    assert_eq!(
+        fs::read_to_string(f.a.join("code.txt")).unwrap(),
+        "keep this\n"
+    );
+    fs::write(f.a.join(".git/info/exclude"), "code.txt\n").unwrap();
+    assert!(
+        f.store
+            .apply_file_action(&repo, &token, FileAction::Clean, None)
+            .is_err()
+    );
+    assert_eq!(
+        fs::read_to_string(f.a.join("code.txt")).unwrap(),
+        "keep this\n"
+    );
+}
+
+#[test]
+fn file_actions_apply_only_to_the_selected_paths() {
+    let f = Fixture::new();
+    let repo = f.store.list().unwrap().remove(0);
+    fs::write(f.a.join("code.txt"), "edited\n").unwrap();
+    fs::write(f.a.join("[new].txt"), "stage this\n").unwrap();
+    fs::write(f.a.join("other.txt"), "keep this\n").unwrap();
+
+    let preview = f.store.worktree_changes(&repo).unwrap();
+    let after_add = f
+        .store
+        .apply_file_action(&repo, &preview.token, FileAction::Add, Some(0))
+        .unwrap();
+    assert_eq!(after_add.untracked, ["other.txt"]);
+    assert_eq!(git(&f.a, &["diff", "--cached", "--name-only"]), "[new].txt");
+
+    f.store
+        .apply_file_action(&repo, &after_add.token, FileAction::Delete, Some(0))
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(f.a.join("code.txt")).unwrap(),
+        "edited\n"
+    );
+    assert!(!f.a.join("other.txt").exists());
+    assert!(f.a.join("[new].txt").is_file());
+}
+
+#[test]
+fn deleting_all_untracked_checks_the_reviewed_list_and_preserves_ignored_files() {
+    let f = Fixture::new();
+    let repo = f.store.list().unwrap().remove(0);
+    fs::write(f.a.join("code.txt"), "tracked change\n").unwrap();
+    fs::write(f.a.join("draft.txt"), "draft\n").unwrap();
+    fs::write(f.a.join(".git/info/exclude"), "private.txt\n").unwrap();
+    fs::write(f.a.join("private.txt"), "ignored\n").unwrap();
+    let preview = f.store.worktree_changes(&repo).unwrap();
+    fs::create_dir(f.a.join("new")).unwrap();
+    fs::write(f.a.join("new/later.txt"), "unreviewed\n").unwrap();
+    assert!(
+        f.store
+            .apply_file_action(&repo, &preview.token, FileAction::Delete, None)
+            .is_err()
+    );
+    assert!(f.a.join("draft.txt").is_file());
+    assert!(f.a.join("new/later.txt").is_file());
+
+    let preview = f.store.worktree_changes(&repo).unwrap();
+    let after = f
+        .store
+        .apply_file_action(&repo, &preview.token, FileAction::Delete, None)
+        .unwrap();
+    assert_eq!(after.tracked[0].path, "code.txt");
+    assert!(after.untracked.is_empty());
+    assert_eq!(
+        fs::read_to_string(f.a.join("code.txt")).unwrap(),
+        "tracked change\n"
+    );
+    assert_eq!(
+        fs::read_to_string(f.a.join("private.txt")).unwrap(),
+        "ignored\n"
+    );
+    assert!(!f.a.join("new/later.txt").exists());
+}
+
+#[test]
+fn ignoring_files_adds_literal_rules_and_preserves_the_files() {
+    let f = Fixture::new();
+    let repo = f.store.list().unwrap().remove(0);
+    fs::write(f.a.join(".gitignore"), "# existing rule\n/old.txt").unwrap();
+    fs::write(f.a.join("[draft].txt"), "keep\n").unwrap();
+    fs::write(f.a.join("d.txt"), "unrelated\n").unwrap();
+    let preview = f.store.worktree_changes(&repo).unwrap();
+    let after = f
+        .store
+        .apply_file_action(&repo, &preview.token, FileAction::Ignore, Some(1))
+        .unwrap();
+    assert_eq!(after.untracked, [".gitignore", "d.txt"]);
+    assert!(f.a.join("[draft].txt").is_file());
+    assert!(
+        fs::read_to_string(f.a.join(".gitignore"))
+            .unwrap()
+            .starts_with("# existing rule\n/old.txt\n")
+    );
+
+    let after = f
+        .store
+        .apply_file_action(&repo, &after.token, FileAction::Ignore, None)
+        .unwrap();
+    assert_eq!(after.untracked, [".gitignore"]);
+    assert!(f.a.join("d.txt").is_file());
+}
+
+#[test]
+fn local_commit_includes_tracked_edits_and_staged_files_only() {
+    let f = Fixture::new();
+    let repo = f.store.list().unwrap().remove(0);
+    let remote_head = git(&f.remote, &["rev-parse", "main"]);
+    fs::write(f.a.join("code.txt"), "tracked change\n").unwrap();
+    fs::write(f.a.join("include.txt"), "stage me\n").unwrap();
+    git(&f.a, &["add", "include.txt"]);
+    fs::write(f.a.join("vanished.txt"), "removed before commit\n").unwrap();
+    git(&f.a, &["add", "vanished.txt"]);
+    fs::remove_file(f.a.join("vanished.txt")).unwrap();
+    fs::write(f.a.join("untracked.txt"), "keep local\n").unwrap();
+
+    let preview = f.store.worktree_changes(&repo).unwrap();
+    let after = f
+        .store
+        .apply_file_action(&repo, &preview.token, FileAction::Commit, None)
+        .unwrap();
+    assert!(after.tracked.is_empty());
+    assert_eq!(after.untracked, ["untracked.txt"]);
+    assert_eq!(
+        git(&f.a, &["log", "-1", "--format=%s"]),
+        "Sgit Auto: code.txt, include.txt"
+    );
+    assert_eq!(
+        git(
+            &f.a,
+            &["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"]
+        ),
+        "code.txt\ninclude.txt"
+    );
+    assert_eq!(git(&f.remote, &["rev-parse", "main"]), remote_head);
+}
+
+#[test]
+fn single_tracked_file_actions_preserve_other_edits_and_staged_files() {
+    let f = Fixture::new();
+    let repo = f.store.list().unwrap().remove(0);
+    fs::write(f.a.join("code.txt"), "staged version\n").unwrap();
+    git(&f.a, &["add", "code.txt"]);
+    fs::write(f.a.join("code.txt"), "latest version\n").unwrap();
+    fs::write(f.a.join("[new].txt"), "selected\n").unwrap();
+    fs::write(f.a.join("other.txt"), "other staged file\n").unwrap();
+    git(
+        &f.a,
+        &["--literal-pathspecs", "add", "--", "[new].txt", "other.txt"],
+    );
+
+    let preview = f.store.worktree_changes(&repo).unwrap();
+    assert_eq!(preview.tracked[0].path, "[new].txt");
+    let after = f
+        .store
+        .apply_file_action(&repo, &preview.token, FileAction::Commit, Some(0))
+        .unwrap();
+    assert_eq!(
+        git(
+            &f.a,
+            &["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"]
+        ),
+        "[new].txt"
+    );
+    assert_eq!(git(&f.a, &["show", ":code.txt"]), "staged version");
+    assert_eq!(
+        fs::read_to_string(f.a.join("code.txt")).unwrap(),
+        "latest version\n"
+    );
+    assert_eq!(after.tracked[0].path, "code.txt");
+
+    f.store
+        .apply_file_action(&repo, &after.token, FileAction::Clean, Some(0))
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(f.a.join("code.txt")).unwrap(),
+        "initial\n"
+    );
+    assert_eq!(git(&f.a, &["diff", "--cached", "--name-only"]), "other.txt");
+    assert_eq!(
+        git(&f.a, &["log", "-1", "--format=%s"]),
+        "Sgit Auto: [new].txt"
+    );
+}
+
+#[test]
+fn single_commit_does_not_capture_an_untracked_replacement() {
+    let f = Fixture::new();
+    let repo = f.store.list().unwrap().remove(0);
+    git(&f.a, &["rm", "code.txt"]);
+    fs::write(f.a.join("code.txt"), "private replacement\n").unwrap();
+    let head = git(&f.a, &["rev-parse", "HEAD"]);
+    let preview = f.store.worktree_changes(&repo).unwrap();
+
+    assert!(
+        f.store
+            .apply_file_action(&repo, &preview.token, FileAction::Commit, Some(0))
+            .is_err()
+    );
+    assert_eq!(git(&f.a, &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        git(&f.a, &["diff", "--cached", "--name-status"]),
+        "D\tcode.txt"
+    );
+    assert_eq!(
+        fs::read_to_string(f.a.join("code.txt")).unwrap(),
+        "private replacement\n"
+    );
 }

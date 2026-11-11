@@ -29,6 +29,18 @@
 
   type GroupView = 'all' | 'ungrouped' | number;
 
+  interface WorktreeChanges {
+    tracked: { path: string; status: string; action_blocked: string | null }[];
+    untracked: string[];
+    token: string;
+    has_head: boolean;
+    clean_blocked: string | null;
+    commit_blocked: string | null;
+  }
+
+  type FileAction = 'clean' | 'commit' | 'add' | 'ignore' | 'delete';
+  type PendingFileAction = { kind: 'clean' | 'delete'; file?: number };
+
   interface RemoteInfo {
     name: string;
     fetch_urls: string[];
@@ -93,9 +105,15 @@
   let infoRow = $state<Status | null>(null);
   let infoRemotes = $state<RemoteInfo[] | null>(null);
   let infoError = $state('');
+  let infoChanges = $state<WorktreeChanges | null>(null);
+  let infoChangesError = $state('');
+  let infoChangesNotice = $state('');
+  let pendingFileAction = $state<PendingFileAction | null>(null);
+  let confirmDiskRemoval = $state(false);
+  const untrackedFiles = $derived(infoChanges?.untracked.filter(isUntrackedFile) ?? []);
+  const fileActionsDisabled = $derived(busy || confirmDiskRemoval || pendingFileAction !== null);
   let infoRequest = 0;
 
-  let confirmDiskRemoval = $state(false);
   let cloneDialog: HTMLDialogElement;
   let cloneAddress = $state('');
   let cloneParent = $state('');
@@ -376,13 +394,70 @@
     }
   }
 
+  function describeChange(status: string) {
+    if (['DD', 'AU', 'UD', 'UA', 'DU', 'AA', 'UU'].includes(status)) return '冲突';
+    const kinds: Record<string, string> = { M: '修改', A: '新增', D: '删除', T: '类型变更' };
+    return [...status].flatMap((code, index) => code === ' ' ? []
+      : [`${index === 0 ? '已暂存' : '未暂存'} · ${kinds[code] ?? code}`]).join(' / ');
+  }
+
+  async function readInfoChanges(repository: Repository, request: number) {
+    try {
+      const changes = await invoke<WorktreeChanges>('repository_changes', { repository });
+      if (request === infoRequest) infoChanges = changes;
+    } catch (cause) {
+      if (request === infoRequest) infoChangesError = String(cause);
+    }
+  }
+
+  function isUntrackedFile(path: string) {
+    return !path.endsWith('/');
+  }
+
+  function canIgnoreFile(path: string) {
+    return isUntrackedFile(path) && !/(^|\/)\.gitignore$/i.test(path) && !/[\r\n]/.test(path);
+  }
+
+  async function applyFileAction(kind: FileAction, file?: number) {
+    if (busy || confirmDiskRemoval || !infoRow || !infoChanges) return;
+    const repository = infoRow.repository;
+    const token = infoChanges.token;
+    busy = true;
+    pendingFileAction = null;
+    infoChangesError = '';
+    infoChangesNotice = '';
+    try {
+      infoChanges = await invoke<WorktreeChanges>('apply_repository_file_action', {
+        repository, token, action: { kind }, file: file ?? null,
+      });
+      if (kind === 'commit') infoChangesNotice = '已创建本地提交';
+    } catch (cause) {
+      infoChanges = null;
+      await readInfoChanges(repository, infoRequest);
+      infoChangesError = [String(cause), infoChangesError].filter(Boolean).join('\n');
+    }
+    try {
+      await load();
+      infoRow = rows.find((row) => row.repository.id === repository.id) ?? infoRow;
+    } catch (cause) {
+      infoChangesError = [infoChangesError, String(cause)].filter(Boolean).join('\n');
+    } finally {
+      busy = false;
+    }
+  }
+
   async function showInfo(row: Status) {
     const request = ++infoRequest;
     infoRow = row;
     infoRemotes = null;
     infoError = '';
+    infoChanges = null;
+    infoChangesError = '';
+    infoChangesNotice = '';
+    pendingFileAction = null;
     confirmDiskRemoval = false;
     infoDialog.showModal();
+    void readInfoChanges(row.repository, request);
     try {
       const remotes = await invoke<RemoteInfo[]>('repository_remotes', { repository: row.repository });
       if (request === infoRequest) infoRemotes = remotes;
@@ -602,6 +677,116 @@
       <h2 id="info-title">{infoRow.repository.id}</h2>
       <p class="info-status" data-tone={state.tone}><span class="status-dot" aria-hidden="true"></span>{state.label}</p>
     </div>
+    {#if infoChangesError || infoChangesNotice}
+      <div class="worktree-feedback">
+        {#if infoChangesError}<p class="banner error" role="alert">{infoChangesError}</p>{/if}
+        {#if infoChangesNotice}<p class="banner" role="status">{infoChangesNotice}</p>{/if}
+      </div>
+    {/if}
+    {#if infoChanges}
+      <section class="worktree-files" aria-labelledby="tracked-files-title">
+        <div class="worktree-heading">
+          <h3 id="tracked-files-title">已改动文件 <span>{infoChanges.tracked.length}</span></h3>
+          <div class="actions">
+            <button class="secondary remove-repository"
+              disabled={fileActionsDisabled || !infoChanges.tracked.length || !!infoChanges.clean_blocked}
+              onclick={() => pendingFileAction = { kind: 'clean' }}>全部丢弃</button>
+            <button class="secondary" disabled={fileActionsDisabled || !infoChanges.tracked.length || !!infoChanges.commit_blocked}
+              onclick={() => applyFileAction('commit')}>全部提交</button>
+          </div>
+        </div>
+        {#if infoChanges.clean_blocked}<p class="banner warning">{infoChanges.clean_blocked}</p>{/if}
+        {#if pendingFileAction?.kind === 'clean'}
+          {@const file = pendingFileAction.file}
+          <div class="restore-confirmation">
+            {#if file === undefined}
+              <p>丢弃全部 {infoChanges.tracked.length} 项改动？已暂存和未暂存的改动都会丢失，已暂存的新文件也会移除。</p>
+            {:else}
+              {@const changed = infoChanges.tracked[file]}
+              {#if changed.status.startsWith('A')}
+                <p>丢弃已暂存的新文件 <code>{changed.path}</code>？确认后会从磁盘移除此文件。</p>
+              {:else}
+                <p>丢弃 <code>{changed.path}</code> 的改动？此文件的已暂存和未暂存改动都会丢失。</p>
+              {/if}
+            {/if}
+            <div class="actions">
+              <button class="secondary" onclick={() => pendingFileAction = null}>取消</button>
+              <button class="danger" onclick={() => applyFileAction('clean', file)}>确认丢弃</button>
+            </div>
+          </div>
+        {/if}
+        {#if infoChanges.tracked.length}
+          <ul class="file-list">
+            {#each infoChanges.tracked as file, index}
+              {@const rowDisabled = fileActionsDisabled || !!infoChanges.commit_blocked || !!file.action_blocked}
+              <li title={file.action_blocked ?? undefined}>
+                <div class="file-change">
+                  <span>{describeChange(file.status)}</span>
+                  <code title={file.path}>{file.path}</code>
+                </div>
+                <div class="actions file-actions">
+                  <button class="secondary remove-repository" aria-label={'丢弃 ' + file.path}
+                    disabled={rowDisabled || !infoChanges.has_head}
+                    onclick={() => pendingFileAction = { kind: 'clean', file: index }}>丢弃</button>
+                  <button class="secondary" aria-label={'提交 ' + file.path} disabled={rowDisabled}
+                    onclick={() => applyFileAction('commit', index)}>提交</button>
+                </div>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </section>
+      <section class="worktree-files" aria-labelledby="untracked-files-title">
+        <div class="worktree-heading">
+          <h3 id="untracked-files-title">未跟踪文件 <span>{infoChanges.untracked.length}</span></h3>
+          <div class="actions">
+            <button class="secondary" disabled={fileActionsDisabled || !untrackedFiles.length}
+              title="将全部未跟踪文件加入版本控制并暂存" onclick={() => applyFileAction('add')}>暂存全部</button>
+            <button class="secondary" disabled={fileActionsDisabled || !untrackedFiles.some(canIgnoreFile)}
+              title="将未跟踪文件加入 .gitignore" onclick={() => applyFileAction('ignore')}>忽略全部</button>
+            <button class="secondary remove-repository" disabled={fileActionsDisabled || !untrackedFiles.length}
+              onclick={() => pendingFileAction = { kind: 'delete' }}>删除全部</button>
+          </div>
+        </div>
+        {#if pendingFileAction?.kind === 'delete'}
+          {@const file = pendingFileAction.file}
+          <div class="restore-confirmation">
+            {#if file === undefined}
+              <p>永久删除列表中的 {untrackedFiles.length} 个未跟踪文件？</p>
+            {:else}
+              <p>永久删除 <code>{infoChanges.untracked[file]}</code>？</p>
+            {/if}
+            <div class="actions">
+              <button class="secondary" onclick={() => pendingFileAction = null}>取消</button>
+              <button class="danger" onclick={() => applyFileAction('delete', file)}>确认删除</button>
+            </div>
+          </div>
+        {/if}
+        {#if infoChanges.untracked.length}
+          <ul class="file-list">
+            {#each infoChanges.untracked as file, index}
+              <li>
+                <code>{file}</code>
+                {#if isUntrackedFile(file)}
+                  <div class="actions file-actions">
+                    <button class="secondary" title="加入版本控制并暂存" aria-label={'暂存 ' + file}
+                      onclick={() => applyFileAction('add', index)} disabled={fileActionsDisabled}>暂存</button>
+                    <button class="secondary" title="加入 .gitignore" aria-label={'忽略 ' + file}
+                      onclick={() => applyFileAction('ignore', index)} disabled={fileActionsDisabled || !canIgnoreFile(file)}>忽略</button>
+                    <button class="secondary remove-repository" aria-label={'删除 ' + file}
+                      onclick={() => pendingFileAction = { kind: 'delete', file: index }} disabled={fileActionsDisabled}>删除</button>
+                  </div>
+                {:else}
+                  <span>独立 Git 仓库</span>
+                {/if}
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </section>
+    {:else if !infoChangesError}
+      <p class="worktree-feedback muted" role="status">正在读取文件变动…</p>
+    {/if}
     <dl class="repo-details">
       <dt>本地路径</dt>
       <dd><code>{infoRow.repository.path}</code></dd>
@@ -624,8 +809,6 @@
       <dd>{infoRow.branch ?? '未检出分支'}</dd>
       <dt>上游分支</dt>
       <dd>{infoRow.upstream ?? '未配置'}</dd>
-      <dt>本地变更</dt>
-      <dd>{infoRow.changes} 处已跟踪或暂存 · {infoRow.untracked} 项未跟踪</dd>
       {#if infoRow.ahead !== null && infoRow.behind !== null}
         <dt>远端进度</dt>
         <dd>{infoRow.ahead} 个待推送 · {infoRow.behind} 个待拉取 <span class="muted">（基于最近一次获取）</span></dd>
@@ -668,7 +851,7 @@
       <div class="scan-footer info-footer">
         <div class="actions">
           <button class="secondary" onclick={() => infoRow && remove(infoRow.repository)} disabled={busy}>从列表移除</button>
-          <button class="secondary remove-repository" onclick={() => confirmDiskRemoval = true} disabled={busy}>从磁盘删除</button>
+          <button class="secondary remove-repository" onclick={() => { pendingFileAction = null; confirmDiskRemoval = true; }} disabled={busy}>从磁盘删除</button>
         </div>
         <button class="primary" onclick={() => infoDialog.close()} disabled={busy}>关闭</button>
       </div>

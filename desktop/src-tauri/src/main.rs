@@ -3,7 +3,8 @@
 mod recycle;
 
 use sgit::{
-    Dashboard, Group, RemoteInfo, Repository, Result, ScanResult, Store, SyncApproval, SyncReport,
+    Dashboard, FileAction, Group, RemoteInfo, Repository, Result, ScanResult, Store, SyncApproval,
+    SyncReport, WorktreeChanges,
 };
 use std::path::PathBuf;
 use tauri::{Manager, async_runtime::spawn_blocking};
@@ -43,6 +44,21 @@ async fn assign_repository_group(
 #[tauri::command]
 async fn repository_remotes(repository: Repository) -> Result<Vec<RemoteInfo>> {
     with_store(move |store| store.remotes(&repository)).await
+}
+
+#[tauri::command]
+async fn repository_changes(repository: Repository) -> Result<WorktreeChanges> {
+    with_store(move |store| store.worktree_changes(&repository)).await
+}
+
+#[tauri::command]
+async fn apply_repository_file_action(
+    repository: Repository,
+    token: String,
+    action: FileAction,
+    file: Option<usize>,
+) -> Result<WorktreeChanges> {
+    with_store(move |store| store.apply_file_action(&repository, &token, action, file)).await
 }
 
 #[tauri::command]
@@ -116,6 +132,8 @@ fn main() {
             create_group,
             assign_repository_group,
             repository_remotes,
+            repository_changes,
+            apply_repository_file_action,
             scan_repositories,
             add_scanned_repositories,
             clone_repository,

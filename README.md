@@ -82,6 +82,6 @@ npm run build
 
 ## GitHub 发布
 
-推送两段式版本标签（如 `v1.0`）会运行 GitHub Actions。工作流先验证版本，运行测试，再构建 macOS Apple Silicon 和 Intel 的 DMG、Windows x64 的安装程序、Linux x64 的 DEB 和 AppImage，以及各平台的独立 CLI。全部构建完成后，安装包会一起上传到 GitHub Release。
+推送两段式版本标签（如 `v1.1`）会运行 GitHub Actions。工作流验证版本并运行测试，然后只构建 macOS Apple Silicon（ARM64）的桌面 DMG 和独立 CLI 压缩包，并上传到 GitHub Release。
 
-应用和 CLI 的包版本使用三段式 SemVer，例如 `1.0.0`。标签和界面使用两段式版本，例如 `v1.0` 和 `1.0`。macOS 发布包使用临时签名，未经 Apple 公证。Windows 安装包未签名。
+应用和 CLI 的包版本使用三段式 SemVer，例如 `1.1.0`。标签和界面使用两段式版本，例如 `v1.1` 和 `1.1`。macOS 发布包使用临时签名，未经 Apple 公证。

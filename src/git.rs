@@ -1,11 +1,13 @@
 use crate::{
-    Operation, Outcome, RemoteInfo, Repository, RepositoryStatus, Result, SyncApproval, SyncResult,
-    SyncReview,
+    ChangedFile, FileAction, Operation, Outcome, RemoteInfo, Repository, RepositoryStatus, Result,
+    SyncApproval, SyncResult, SyncReview, WorktreeChanges,
 };
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
     hash::{DefaultHasher, Hash, Hasher},
-    path::{Path, PathBuf},
+    io::Write,
+    path::{Component, Path, PathBuf},
     process::{Command, Output, Stdio},
 };
 
@@ -30,6 +32,8 @@ struct Prepared<'a> {
 struct Changes {
     tracked: usize,
     tracked_status: u64,
+    tracked_entries: Vec<Vec<u8>>,
+    ignored: Vec<Vec<u8>>,
     untracked: Vec<Vec<u8>>,
     conflicts: bool,
 }
@@ -198,30 +202,39 @@ fn upstream(path: &Path, branch: &str) -> Result<Upstream> {
 }
 
 fn changes(path: &Path, list_files: bool) -> Result<Changes> {
-    let output = git(
-        path,
-        &[
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--no-renames",
-            if list_files {
-                "--untracked-files=all"
-            } else {
-                "--untracked-files=normal"
-            },
-            "--ignore-submodules=dirty",
-        ],
-    )?;
+    read_changes(path, list_files, false)
+}
+
+fn read_changes(path: &Path, list_files: bool, include_ignored: bool) -> Result<Changes> {
+    let mut args = vec![
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--no-renames",
+        if list_files {
+            "--untracked-files=all"
+        } else {
+            "--untracked-files=normal"
+        },
+        "--ignore-submodules=dirty",
+    ];
+    if include_ignored {
+        args.push("--ignored=matching");
+    }
+    let output = git(path, &args)?;
     let mut changes = Changes::default();
     let mut tracked_status = DefaultHasher::new();
     for entry in output.split(|byte| *byte == 0) {
         match entry.get(..2) {
             Some(b"??") => changes.untracked.push(entry[3..].to_vec()),
+            Some(b"!!") => changes.ignored.push(entry[3..].to_vec()),
             Some(code) => {
                 changes.tracked += 1;
                 if list_files {
                     entry.hash(&mut tracked_status);
+                    if include_ignored {
+                        changes.tracked_entries.push(entry.to_vec());
+                    }
                 }
                 changes.conflicts |=
                     matches!(code, b"DD" | b"AU" | b"UD" | b"UA" | b"DU" | b"AA" | b"UU");
@@ -250,13 +263,448 @@ fn check_in_progress(path: &Path, changes: &Changes) -> Result<()> {
             .try_exists()
             .map_err(|error| error.to_string())?
         {
-            return Err("Finish the Git operation already in progress before syncing.".into());
+            return Err("Finish the Git operation already in progress and try again.".into());
         }
     }
     if changes.conflicts {
-        return Err("Resolve unmerged files before syncing.".into());
+        return Err("Resolve unmerged files and try again.".into());
     }
     Ok(())
+}
+
+const PROTECTED_PATH: &str =
+    "This change overlaps an untracked or ignored path. Move that file aside before continuing.";
+
+fn normalized_path(path: &[u8]) -> String {
+    String::from_utf8_lossy(path)
+        .trim_end_matches('/')
+        .to_lowercase()
+}
+
+fn protected_paths(changes: &Changes) -> BTreeSet<String> {
+    changes
+        .ignored
+        .iter()
+        .chain(&changes.untracked)
+        .map(|path| normalized_path(path))
+        .collect()
+}
+
+fn has_related_path(name: &str, paths: &BTreeSet<String>) -> bool {
+    let descendants = format!("{name}/");
+    name.match_indices('/')
+        .any(|(index, _)| paths.contains(&name[..index]))
+        || paths
+            .range(descendants.clone()..)
+            .next()
+            .is_some_and(|path| path.starts_with(&descendants))
+}
+
+fn is_protected(name: &str, protected: &BTreeSet<String>) -> bool {
+    protected.contains(name) || has_related_path(name, protected)
+}
+
+fn single_file_block(
+    name: &str,
+    tracked: &BTreeSet<String>,
+    protected: &BTreeSet<String>,
+) -> Option<&'static str> {
+    if is_protected(name, protected) {
+        Some(PROTECTED_PATH)
+    } else if has_related_path(name, tracked) {
+        Some("This path is part of a file and directory replacement. Use the bulk action.")
+    } else {
+        None
+    }
+}
+
+fn file_action_token(path: &Path, head: Option<&str>, changes: &Changes) -> String {
+    let mut hasher = DefaultHasher::new();
+    branch(path).ok().hash(&mut hasher);
+    head.hash(&mut hasher);
+    changes.tracked_status.hash(&mut hasher);
+    changes.untracked.hash(&mut hasher);
+    changes.ignored.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn is_untracked_file(name: &[u8]) -> bool {
+    !name.ends_with(b"/")
+}
+
+pub(crate) fn worktree_changes(repo: &Repository) -> Result<WorktreeChanges> {
+    let path = registered_root(repo)?;
+    let changes = read_changes(path, true, true)?;
+    let head = line(path, &["rev-parse", "--verify", "HEAD^{commit}"]).ok();
+    let tracked: BTreeSet<_> = changes
+        .tracked_entries
+        .iter()
+        .map(|entry| normalized_path(&entry[3..]))
+        .collect();
+    let protected = protected_paths(&changes);
+    let commit_blocked = if tracked.is_empty() {
+        None
+    } else {
+        check_in_progress(path, &changes).err()
+    };
+    let clean_blocked = if tracked.is_empty() {
+        None
+    } else if let Some(error) = &commit_blocked {
+        Some(error.clone())
+    } else if head.is_none() {
+        Some("This repository has no commit to restore from.".into())
+    } else if tracked.iter().any(|name| is_protected(name, &protected)) {
+        Some(PROTECTED_PATH.into())
+    } else {
+        None
+    };
+    Ok(WorktreeChanges {
+        tracked: changes
+            .tracked_entries
+            .iter()
+            .map(|entry| ChangedFile {
+                path: String::from_utf8_lossy(&entry[3..]).into_owned(),
+                status: String::from_utf8_lossy(&entry[..2]).into_owned(),
+                action_blocked: single_file_block(
+                    &normalized_path(&entry[3..]),
+                    &tracked,
+                    &protected,
+                ),
+            })
+            .collect(),
+        untracked: changes
+            .untracked
+            .iter()
+            .map(|name| String::from_utf8_lossy(name).into_owned())
+            .collect(),
+        token: file_action_token(path, head.as_deref(), &changes),
+        has_head: head.is_some(),
+        clean_blocked,
+        commit_blocked,
+    })
+}
+
+fn run_with_file_paths(path: &Path, options: &[&str], entries: &[&[u8]]) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut paths = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
+    for entry in entries {
+        paths
+            .write_all(entry)
+            .and_then(|_| paths.write_all(b"\0"))
+            .map_err(|error| error.to_string())?;
+    }
+    let file = paths
+        .path()
+        .to_str()
+        .ok_or("Cannot encode the temporary file path.")?;
+    let input = format!("--pathspec-from-file={file}");
+    let mut args = vec!["--literal-pathspecs"];
+    args.extend_from_slice(options);
+    args.extend([&input, "--pathspec-file-nul"]);
+    git(path, &args)?;
+    Ok(())
+}
+
+fn restore_files(path: &Path, head: &str, entries: &[&[u8]]) -> Result<()> {
+    run_with_file_paths(
+        path,
+        &[
+            "restore",
+            "--staged",
+            "--worktree",
+            "--no-recurse-submodules",
+            &format!("--source={head}"),
+        ],
+        entries,
+    )
+}
+
+fn auto_commit_message<'a>(paths: impl Iterator<Item = &'a [u8]>) -> String {
+    let names: Vec<_> = paths
+        .map(|path| {
+            String::from_utf8_lossy(path)
+                .replace('\\', "\\\\")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t")
+        })
+        .collect();
+    format!("Sgit Auto: {}", names.join(", "))
+}
+
+fn auto_commit_all(path: &Path) -> Result<()> {
+    // Ask Git for the index it would commit, including additions staged just before syncing.
+    let preview = git(
+        path,
+        &[
+            "-c",
+            "status.renames=false",
+            "commit",
+            "--all",
+            "--dry-run",
+            "--porcelain",
+            "-z",
+            "--untracked-files=no",
+        ],
+    )?;
+    let paths = preview
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| match entry.first() {
+            Some(b'A' | b'D' | b'M' | b'T') => entry.get(3..),
+            _ => None,
+        });
+    let mut message = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
+    writeln!(message, "{}", auto_commit_message(paths)).map_err(|error| error.to_string())?;
+    let message_path = message
+        .path()
+        .to_str()
+        .ok_or("Cannot encode the commit message file path.")?;
+    git(
+        path,
+        &[
+            "commit",
+            "--all",
+            "--cleanup=verbatim",
+            "--file",
+            message_path,
+        ],
+    )?;
+    Ok(())
+}
+
+fn untracked_file_path(root: &Path, name: &[u8]) -> Result<PathBuf> {
+    #[cfg(unix)]
+    let relative = {
+        use std::os::unix::ffi::OsStrExt;
+        Path::new(std::ffi::OsStr::from_bytes(name))
+    };
+    #[cfg(not(unix))]
+    let relative = Path::new(std::str::from_utf8(name).map_err(|error| error.to_string())?);
+
+    let mut path = root.to_path_buf();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let Component::Normal(part) = component else {
+            return Err("Git reported an invalid file path.".into());
+        };
+        if part.eq_ignore_ascii_case(".git") {
+            return Err("Cannot operate on Git metadata.".into());
+        }
+        path.push(part);
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("{}: {error}", relative.display()))?;
+        let kind = metadata.file_type();
+        let valid = if components.peek().is_some() {
+            kind.is_dir()
+                && path
+                    .join(".git")
+                    .symlink_metadata()
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        } else {
+            kind.is_file() || kind.is_symlink()
+        };
+        if !valid {
+            return Err(format!(
+                "{} is no longer an untracked file.",
+                relative.display()
+            ));
+        }
+    }
+    Ok(path)
+}
+
+fn select_paths<'a, 'b>(paths: &'a [&'b [u8]], file: Option<usize>) -> Result<&'a [&'b [u8]]> {
+    match file {
+        Some(index) => paths
+            .get(index)
+            .map(std::slice::from_ref)
+            .ok_or_else(|| "The selected file is no longer in the list.".into()),
+        None => Ok(paths),
+    }
+}
+
+fn can_ignore(name: &[u8]) -> bool {
+    let basename = name.rsplit(|byte| *byte == b'/').next().unwrap_or(name);
+    !basename.eq_ignore_ascii_case(b".gitignore")
+        && !name.contains(&b'\n')
+        && !name.contains(&b'\r')
+}
+
+fn ignore_files(root: &Path, files: &[(&[u8], PathBuf)]) -> Result<()> {
+    let mut rules_by_file = BTreeMap::<PathBuf, Vec<u8>>::new();
+    for (name, file) in files {
+        // Use the closest existing ignore file so its new rule takes precedence.
+        let mut directory = file.parent().unwrap_or(root);
+        let mut prefix_len = name.len();
+        let (ignore_path, relative_name) = loop {
+            if directory == root {
+                break (root.join(".gitignore"), *name);
+            }
+            let Some(slash) = name[..prefix_len].iter().rposition(|byte| *byte == b'/') else {
+                return Err("Git reported an invalid file path.".into());
+            };
+            let candidate = directory.join(".gitignore");
+            if candidate
+                .symlink_metadata()
+                .is_ok_and(|metadata| metadata.is_file())
+            {
+                break (candidate, &name[slash + 1..]);
+            }
+            prefix_len = slash;
+            directory = directory.parent().unwrap_or(root);
+        };
+        let rules = rules_by_file.entry(ignore_path).or_default();
+        rules.push(b'/');
+        for &byte in relative_name {
+            if matches!(byte, b'\\' | b'[' | b']' | b'*' | b'?' | b' ') {
+                rules.push(b'\\');
+            }
+            rules.push(byte);
+        }
+        rules.push(b'\n');
+    }
+
+    for (path, rules) in rules_by_file {
+        let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap_or(root))
+            .map_err(|error| error.to_string())?;
+        match path.symlink_metadata() {
+            Ok(metadata) if metadata.is_file() => {
+                let content = fs::read(&path).map_err(|error| error.to_string())?;
+                file.write_all(&content)
+                    .map_err(|error| error.to_string())?;
+                if !content.is_empty() && !content.ends_with(b"\n") {
+                    file.write_all(b"\n").map_err(|error| error.to_string())?;
+                }
+                file.as_file()
+                    .set_permissions(metadata.permissions())
+                    .map_err(|error| error.to_string())?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => {
+                return Err(format!(
+                    "Cannot edit {}: expected a regular file.",
+                    path.display()
+                ));
+            }
+        }
+        file.write_all(&rules).map_err(|error| error.to_string())?;
+        file.persist(&path)
+            .map_err(|error| format!("Cannot update {}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn apply_file_action(
+    repo: &Repository,
+    token: &str,
+    action: FileAction,
+    file: Option<usize>,
+) -> Result<WorktreeChanges> {
+    let path = registered_root(repo)?;
+    let changes = read_changes(path, true, true)?;
+    let head = line(path, &["rev-parse", "--verify", "HEAD^{commit}"]).ok();
+    if file_action_token(path, head.as_deref(), &changes) != token {
+        return Err("The repository changed. Review the file list again.".into());
+    }
+
+    match action {
+        FileAction::Clean | FileAction::Commit => {
+            let tracked: Vec<_> = changes
+                .tracked_entries
+                .iter()
+                .map(|entry| &entry[3..])
+                .collect();
+            let selected = select_paths(&tracked, file)?;
+            if !selected.is_empty() {
+                check_in_progress(path, &changes)?;
+                if file.is_some() {
+                    let tracked = tracked.iter().map(|name| normalized_path(name)).collect();
+                    if let Some(error) = single_file_block(
+                        &normalized_path(selected[0]),
+                        &tracked,
+                        &protected_paths(&changes),
+                    ) {
+                        return Err(error.into());
+                    }
+                }
+                if matches!(action, FileAction::Commit) {
+                    if file.is_some() {
+                        let message = auto_commit_message(selected.iter().copied());
+                        run_with_file_paths(
+                            path,
+                            &[
+                                "commit",
+                                "--only",
+                                "--cleanup=verbatim",
+                                "--message",
+                                &message,
+                            ],
+                            selected,
+                        )?;
+                    } else {
+                        auto_commit_all(path)?;
+                    }
+                } else {
+                    let head = head.ok_or("This repository has no commit to restore from.")?;
+                    if file.is_none() {
+                        let protected = protected_paths(&changes);
+                        if selected
+                            .iter()
+                            .any(|name| is_protected(&normalized_path(name), &protected))
+                        {
+                            return Err(PROTECTED_PATH.into());
+                        }
+                    }
+                    restore_files(path, &head, selected)?;
+                }
+            }
+        }
+        FileAction::Add | FileAction::Delete | FileAction::Ignore => {
+            let untracked: Vec<_> = changes.untracked.iter().map(Vec::as_slice).collect();
+            let selected: Vec<_> = select_paths(&untracked, file)?
+                .iter()
+                .copied()
+                .filter(|name| is_untracked_file(name))
+                .filter(|name| !matches!(action, FileAction::Ignore) || can_ignore(name))
+                .collect();
+            if file.is_some() && selected.is_empty() {
+                return Err("This action is not available for the selected path.".into());
+            }
+            let files: Vec<_> = selected
+                .iter()
+                .map(|&name| Ok((name, untracked_file_path(path, name)?)))
+                .collect::<Result<_>>()?;
+            match action {
+                FileAction::Add => {
+                    run_with_file_paths(path, &["add", "--ignore-removal"], &selected)?
+                }
+                FileAction::Delete => {
+                    for (name, _) in files {
+                        let file = untracked_file_path(path, name)?;
+                        delete_untracked_file(&file)?;
+                    }
+                }
+                FileAction::Ignore => ignore_files(path, &files)?,
+                _ => unreachable!(),
+            }
+        }
+    }
+    worktree_changes(repo)
+}
+
+fn delete_untracked_file(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        let metadata = path.symlink_metadata().map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink_dir() {
+            return fs::remove_dir(path)
+                .map_err(|error| format!("Cannot delete {}: {error}", path.display()));
+        }
+    }
+    fs::remove_file(path).map_err(|error| format!("Cannot delete {}: {error}", path.display()))
 }
 
 fn distance(path: &Path, upstream: &str) -> Result<(u64, u64)> {
@@ -403,11 +851,7 @@ fn push(
     ensure_same_head(prepared)?;
     let path = prepared.path;
     if commit_changes {
-        let message = format!(
-            "sgit: sync {}",
-            prepared.branch.trim_start_matches("refs/heads/")
-        );
-        git(path, &["commit", "--all", "--message", &message])?;
+        auto_commit_all(path)?;
         *commit = Some(line(path, &["rev-parse", "--verify", &prepared.branch])?);
     }
     let tip = commit.as_deref().unwrap_or(&prepared.head);

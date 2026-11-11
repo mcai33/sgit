@@ -66,6 +66,33 @@ impl Target<'_> {
 }
 
 #[derive(Serialize)]
+pub struct ChangedFile {
+    pub path: String,
+    pub status: String,
+    pub action_blocked: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+pub struct WorktreeChanges {
+    pub tracked: Vec<ChangedFile>,
+    pub untracked: Vec<String>,
+    pub token: String,
+    pub has_head: bool,
+    pub clean_blocked: Option<String>,
+    pub commit_blocked: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FileAction {
+    Clean,
+    Add,
+    Delete,
+    Ignore,
+    Commit,
+}
+
+#[derive(Serialize)]
 pub struct RemoteInfo {
     pub name: String,
     pub fetch_urls: Vec<String>,
@@ -299,6 +326,25 @@ impl Store {
         let registered = self.list()?;
         let index = repository.target().index(&registered)?;
         git::remotes(&registered[index])
+    }
+
+    pub fn worktree_changes(&self, repository: &Repository) -> Result<WorktreeChanges> {
+        let registered = self.list()?;
+        let index = repository.target().index(&registered)?;
+        git::worktree_changes(&registered[index])
+    }
+
+    pub fn apply_file_action(
+        &self,
+        repository: &Repository,
+        token: &str,
+        action: FileAction,
+        file: Option<usize>,
+    ) -> Result<WorktreeChanges> {
+        let _lock = self.lock()?;
+        let registered = self.list()?;
+        let index = repository.target().index(&registered)?;
+        git::apply_file_action(&registered[index], token, action, file)
     }
 
     pub fn status(&self) -> Result<Vec<RepositoryStatus>> {

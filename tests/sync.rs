@@ -95,6 +95,10 @@ fn pushes_tracked_changes_and_explicitly_staged_new_files_then_pulls_on_another_
     fs::write(repo.a.join(".env"), "local secret\n").unwrap();
     git(&repo.a, &["add", "staged.txt"]);
     checked(repo.run(&["push", "device-a"]));
+    assert_eq!(
+        git(&repo.a, &["log", "-1", "--format=%s"]).trim_end(),
+        "Sgit Auto: code.txt, staged.txt"
+    );
     checked(repo.run(&["pull", "device-b"]));
     assert_eq!(
         fs::read_to_string(repo.b.join("code.txt")).unwrap(),
